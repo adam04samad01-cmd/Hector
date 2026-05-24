@@ -1,4 +1,3 @@
-import base64
 import csv
 import html
 import mimetypes
@@ -480,14 +479,6 @@ def get_document_path(document):
     return None
 
 
-def document_url(file_path):
-    """Create a browser-friendly link from a local document controlled by Hector."""
-    file_type, _ = mimetypes.guess_type(file_path)
-    file_type = file_type or "application/octet-stream"
-    file_data = base64.b64encode(file_path.read_bytes()).decode("utf-8")
-    return f"data:{file_type};base64,{file_data}"
-
-
 def insert_document_record(category, subcategory, metadata):
     """Insert one uploaded document into SQLite using parameterized SQL."""
     with get_connection() as connection:
@@ -515,68 +506,259 @@ def insert_document_record(category, subcategory, metadata):
 
 
 def apply_styles():
-    """Add simple Hector 2.1 light theme styling."""
+    """Add Hector 2.3 full light theme restoration styling."""
     st.markdown(
         """
         <style>
-        .stApp { background: #F5F7FA; color: #111827; }
-        h1, h2, h3 { color: #1E3A8A; }
-        p, label, span, div { color: #111827; font-size: 17px; }
+        :root {
+            --hector-bg: #F5F7FA;
+            --hector-card: #FFFFFF;
+            --hector-primary: #1E3A8A;
+            --hector-action: #2563EB;
+            --hector-text: #111827;
+            --hector-secondary: #4B5563;
+            --hector-border: #E5E7EB;
+            --hector-danger: #B91C1C;
+        }
+
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+            background: var(--hector-bg) !important;
+            color: var(--hector-text) !important;
+            font-family: Arial, sans-serif !important;
+        }
+        [data-testid="stHeader"], header {
+            background: rgba(245, 247, 250, 0) !important;
+        }
+        .block-container {
+            max-width: 1180px;
+            padding-top: 32px;
+            padding-bottom: 48px;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            color: var(--hector-primary) !important;
+            letter-spacing: 0 !important;
+            font-weight: 800 !important;
+        }
+        h1 { font-size: 42px !important; }
+        h2 { font-size: 28px !important; margin-top: 24px !important; }
+        h3 { font-size: 22px !important; }
+        p, label, span, div, li {
+            color: var(--hector-text);
+            font-size: 17px;
+            line-height: 1.5;
+        }
+        label, [data-testid="stWidgetLabel"] p {
+            color: var(--hector-text) !important;
+            font-size: 16px !important;
+            font-weight: 700 !important;
+        }
+
         .hector-header {
-            background: #1E3A8A;
+            background: var(--hector-primary);
             color: #FFFFFF;
-            padding: 28px;
+            padding: 30px;
             border-radius: 10px;
             margin-bottom: 24px;
+            box-shadow: 0 8px 22px rgba(30, 58, 138, 0.16);
         }
-        .hector-header h1, .hector-header p { color: #FFFFFF; margin: 0; }
-        .document-card, .details-card, .category-card, .subcategory-card, .placeholder-card, .search-result-card {
-            background: #FFFFFF;
-            border: 1px solid #E5E7EB;
-            border-radius: 10px;
-            padding: 18px;
-            margin: 14px 0;
-            box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06);
-        }
-        .category-card, .subcategory-card, .search-result-card { min-height: 130px; cursor: pointer; }
-        .search-result-card { min-height: 95px; }
-        .category-card:hover, .subcategory-card:hover, .search-result-card:hover {
-            border-color: #2563EB;
-            box-shadow: 0 6px 18px rgba(37, 99, 235, 0.16);
-        }
-        .folder-icon { font-size: 30px; margin-bottom: 8px; }
-        .secondary-text { color: #4B5563; }
-        .open-link {
-            display: inline-block;
-            background: #2563EB;
+        .hector-header h1 {
             color: #FFFFFF !important;
-            padding: 10px 14px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 700;
-            margin-top: 8px;
+            margin: 0 !important;
+            font-size: 44px !important;
+            line-height: 1.1 !important;
+        }
+        .hector-header p {
+            color: #FFFFFF !important;
+            margin: 8px 0 0 0 !important;
+            font-size: 18px !important;
+        }
+
+        .document-card, .details-card, .category-card, .subcategory-card,
+        .placeholder-card, .search-result-card, [data-testid="stForm"] {
+            background: var(--hector-card) !important;
+            border: 1px solid var(--hector-border) !important;
+            border-radius: 10px !important;
+            padding: 18px !important;
+            margin: 14px 0 !important;
+            box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06) !important;
+        }
+        .category-card, .subcategory-card, .search-result-card {
+            min-height: 130px;
             cursor: pointer;
         }
-        .missing-file { color: #991B1B; font-weight: 700; margin-top: 8px; }
+        .search-result-card { min-height: 95px; }
+        .category-card:hover, .subcategory-card:hover, .search-result-card:hover {
+            border-color: var(--hector-action) !important;
+            box-shadow: 0 6px 18px rgba(37, 99, 235, 0.16) !important;
+        }
+        .category-card h2, .subcategory-card h3, .details-card h2, .document-card h3 {
+            color: var(--hector-primary) !important;
+        }
+        .folder-icon { color: var(--hector-action); font-size: 30px; margin-bottom: 8px; }
+        .secondary-text, .stCaption, [data-testid="stCaptionContainer"],
+        [data-testid="stCaptionContainer"] p {
+            color: var(--hector-secondary) !important;
+        }
+        .missing-file {
+            color: var(--hector-danger) !important;
+            font-weight: 700;
+            margin-top: 8px;
+        }
         .breadcrumbs {
             margin: -8px 0 18px 0;
-            color: #4B5563;
+            color: var(--hector-secondary) !important;
             font-size: 16px;
         }
         .breadcrumb-current {
-            color: #111827;
+            color: var(--hector-text) !important;
             font-weight: 700;
         }
         .result-type {
             display: inline-block;
             background: #EFF6FF;
-            color: #1E3A8A;
+            color: var(--hector-primary) !important;
             border: 1px solid #BFDBFE;
             border-radius: 999px;
             padding: 3px 10px;
             font-size: 14px;
             font-weight: 700;
             margin-bottom: 8px;
+        }
+
+        input, textarea, select, option,
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stTextArea"] textarea,
+        div[data-testid="stNumberInput"] input,
+        div[data-baseweb="input"] input,
+        div[data-baseweb="textarea"] textarea {
+            background: var(--hector-card) !important;
+            color: var(--hector-text) !important;
+            border-color: var(--hector-border) !important;
+            caret-color: var(--hector-text) !important;
+            font-size: 17px !important;
+        }
+        input::placeholder, textarea::placeholder {
+            color: #6B7280 !important;
+            opacity: 1 !important;
+        }
+        input:focus, textarea:focus,
+        div[data-testid="stTextInput"] input:focus,
+        div[data-testid="stTextArea"] textarea:focus {
+            border-color: var(--hector-action) !important;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16) !important;
+            outline: none !important;
+        }
+
+        div[data-testid="stSelectbox"],
+        div[data-baseweb="select"],
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="select"] div,
+        div[data-baseweb="select"] input {
+            background: var(--hector-card) !important;
+            color: var(--hector-text) !important;
+            border-color: var(--hector-border) !important;
+        }
+        div[data-baseweb="select"] svg {
+            fill: var(--hector-secondary) !important;
+            color: var(--hector-secondary) !important;
+        }
+        [data-baseweb="popover"], [data-baseweb="popover"] *,
+        [data-baseweb="menu"], [data-baseweb="menu"] *,
+        ul[role="listbox"], ul[role="listbox"] *,
+        div[role="listbox"], div[role="listbox"] *,
+        li[role="option"], div[role="option"] {
+            background: var(--hector-card) !important;
+            color: var(--hector-text) !important;
+            border-color: var(--hector-border) !important;
+        }
+        li[role="option"]:hover, div[role="option"]:hover,
+        li[aria-selected="true"], div[aria-selected="true"] {
+            background: #EFF6FF !important;
+            color: var(--hector-primary) !important;
+        }
+
+        [data-testid="stFileUploader"] section,
+        [data-testid="stFileUploader"] section *,
+        [data-testid="stFileUploaderDropzone"],
+        [data-testid="stFileUploaderDropzone"] * {
+            background: var(--hector-card) !important;
+            color: var(--hector-text) !important;
+            border-color: var(--hector-border) !important;
+        }
+        [data-testid="stFileUploader"] small,
+        [data-testid="stFileUploader"] span {
+            color: var(--hector-secondary) !important;
+        }
+
+        [data-testid="stCheckbox"], [data-testid="stCheckbox"] *,
+        [data-testid="stCheckbox"] label, [data-testid="stCheckbox"] p {
+            color: var(--hector-text) !important;
+            background: transparent !important;
+        }
+        [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] p {
+            font-weight: 600 !important;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button,
+        button[kind="secondary"],
+        div[data-testid="stFormSubmitButton"] button,
+        [data-testid="stFileUploader"] button {
+            background: var(--hector-action) !important;
+            color: #FFFFFF !important;
+            border: 1px solid var(--hector-action) !important;
+            border-radius: 8px !important;
+            padding: 10px 16px !important;
+            font-size: 16px !important;
+            font-weight: 700 !important;
+            box-shadow: none !important;
+            cursor: pointer !important;
+        }
+        .stButton > button:hover,
+        .stDownloadButton > button:hover,
+        button[kind="secondary"]:hover,
+        div[data-testid="stFormSubmitButton"] button:hover,
+        [data-testid="stFileUploader"] button:hover {
+            background: var(--hector-primary) !important;
+            border-color: var(--hector-primary) !important;
+            color: #FFFFFF !important;
+        }
+        .stButton > button *,
+        .stDownloadButton > button *,
+        div[data-testid="stFormSubmitButton"] button *,
+        [data-testid="stFileUploader"] button * {
+            color: #FFFFFF !important;
+            font-size: 16px !important;
+            font-weight: 700 !important;
+        }
+        button[kind="primary"] {
+            background: var(--hector-danger) !important;
+            color: #FFFFFF !important;
+            border: 1px solid var(--hector-danger) !important;
+            border-radius: 8px !important;
+            padding: 10px 16px !important;
+            font-size: 16px !important;
+            font-weight: 800 !important;
+        }
+        button[kind="primary"]:hover {
+            background: #7F1D1D !important;
+            border-color: #7F1D1D !important;
+            color: #FFFFFF !important;
+        }
+        button[kind="primary"] * {
+            color: #FFFFFF !important;
+            font-weight: 800 !important;
+        }
+
+        .stAlert, [data-testid="stAlert"] {
+            background: var(--hector-card) !important;
+            border: 1px solid var(--hector-border) !important;
+            color: var(--hector-text) !important;
+            border-radius: 8px !important;
+        }
+        [data-testid="stAlert"] * {
+            color: var(--hector-text) !important;
         }
         </style>
         """,
@@ -654,10 +836,16 @@ def open_document_link(document):
         st.markdown(f"<p class='missing-file'>{MISSING_FILE_MESSAGE}</p>", unsafe_allow_html=True)
         return
 
-    st.markdown(
-        f"<a class='open-link' href='{document_url(path)}' target='_blank'>Open Document</a>",
-        unsafe_allow_html=True,
+    mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    resolved_path = path.resolve()
+
+    st.download_button(
+        label="Open / Download Document",
+        data=path.read_bytes(),
+        file_name=path.name,
+        mime=mime_type,
     )
+    st.caption(f"Debug file path: {resolved_path}")
 
 
 def show_search_result(item, documents):
@@ -692,7 +880,7 @@ def show_search_result(item, documents):
 
 def show_home_page():
     """Show the Hector home page with global search, categories, and admin access."""
-    show_header("Hector 2.1", "Search all documents, folders, and categories.")
+    show_header("Hector 2.3", "Search all documents, folders, and categories.")
     show_breadcrumbs([{"label": "Home", "action": go_home}])
 
     st.markdown("## Global Document Search")
@@ -1017,7 +1205,7 @@ def show_admin_page():
     confirm = st.checkbox("I understand and want to delete this folder.")
     delete_files = st.checkbox("Also delete document records and files in this folder.")
 
-    if st.button("Delete Folder"):
+    if st.button("Delete Folder", type="primary"):
         if not confirm:
             st.error("Please confirm before deleting this folder.")
             return
@@ -1049,7 +1237,7 @@ def show_admin_page():
 
 
 def main():
-    st.set_page_config(page_title="Hector 2.1", layout="wide")
+    st.set_page_config(page_title="Hector 2.3", layout="wide")
     ensure_storage()
     apply_styles()
 

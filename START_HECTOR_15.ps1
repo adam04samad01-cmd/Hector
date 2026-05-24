@@ -3,6 +3,7 @@ $PythonExe = "C:\Users\Adam Samad\AppData\Roaming\uv\python\cpython-3.11-windows
 $VenvPython = Join-Path $ProjectPath ".hector_venv\Scripts\python.exe"
 $env:TEMP = Join-Path $ProjectPath "pip-temp"
 $env:TMP = $env:TEMP
+$env:TMPDIR = $env:TEMP
 
 New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 Set-Location $ProjectPath
@@ -19,10 +20,36 @@ if (!(Test-Path $VenvPython)) {
 }
 
 if (Test-Path $VenvPython) {
+    & $VenvPython -m pip --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Repairing Hector private Python environment..."
+        & $VenvPython -m ensurepip --upgrade | Out-Null
+    }
+}
+
+if (Test-Path $VenvPython) {
+    & $VenvPython -m pip --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Recreating Hector private Python environment..."
+        Remove-Item -LiteralPath (Join-Path $ProjectPath ".hector_venv") -Recurse -Force
+        & $PythonExe -m venv (Join-Path $ProjectPath ".hector_venv")
+        & $VenvPython -m ensurepip --upgrade | Out-Null
+    }
+}
+
+if (Test-Path $VenvPython) {
     $RunPython = $VenvPython
 } else {
     Write-Host "Private environment could not be created. Using managed Python fallback..."
     $RunPython = $PythonExe
+}
+
+& $RunPython -m pip --version | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Hector could not create pip in the private Python environment."
+    Write-Host "Close this window, delete the .hector_venv folder, then run this launcher again."
+    Read-Host "Press Enter to close"
+    exit 1
 }
 
 & $RunPython -m streamlit --version | Out-Null
@@ -32,5 +59,5 @@ if ($LASTEXITCODE -ne 0) {
     & $RunPython -m pip install -r requirements.txt --break-system-packages
 }
 
-Write-Host "Starting Hector 1.5..."
+Write-Host "Starting Hector 2.3..."
 & $RunPython -m streamlit run app.py
