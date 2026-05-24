@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+.hector_venv/
+env/
+venv/
+
+# Node / local preview dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+
+# Local app data
+hector.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Uploaded/private company documents.
+# Keep the folder out of Git so private PDFs/Word/Excel files are not pushed.
+documents/
+
+# Local temporary files
+tmp/
+pip-temp/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

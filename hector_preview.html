@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hector 1.5 Preview</title>
+  <style>
+    :root {
+      --background: #F5F7FA;
+      --card: #FFFFFF;
+      --primary: #1E3A8A;
+      --accent: #2563EB;
+      --text: #111827;
+      --secondary: #4B5563;
+      --border: #E5E7EB;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: Arial, sans-serif;
+      font-size: 17px;
+      line-height: 1.5;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 22px;
+    }
+
+    header,
+    section {
+      border-radius: 10px;
+    }
+
+    header {
+      background: var(--primary);
+      color: white;
+      padding: 28px;
+      margin-bottom: 24px;
+    }
+
+    header h1,
+    header p {
+      color: white;
+      margin: 0;
+    }
+
+    header p {
+      margin-top: 8px;
+      font-size: 18px;
+    }
+
+    h1,
+    h2 {
+      color: var(--primary);
+    }
+
+    section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06);
+      padding: 22px;
+      margin: 18px 0;
+    }
+
+    code {
+      background: #EFF6FF;
+      color: var(--primary);
+      padding: 3px 6px;
+      border-radius: 5px;
+    }
+
+    .button {
+      display: inline-block;
+      border-radius: 8px;
+      padding: 10px 14px;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .secondary {
+      color: var(--secondary);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Hector 1.5 Preview</h1>
+      <p>Admin folder and document upload features are now in the Streamlit app.</p>
+    </header>
+
+    <section>
+      <h2>Important</h2>
+      <p>
+        This static preview page cannot upload files or save folder changes to your laptop.
+        Browsers block normal HTML files from writing to private folders.
+      </p>
+      <p>
+        To use Hector 1.5, run the Streamlit app locally. That gives Hector a Python backend
+        that can safely save uploads into the project <code>documents</code> folder and update CSV files.
+      </p>
+    </section>
+
+    <section>
+      <h2>How To Open Hector 1.5</h2>
+      <p>Open PowerShell in the project folder and run:</p>
+      <p><code>streamlit run app.py</code></p>
+      <p class="secondary">
+        The app includes Admin / Manage Folders, folder creation, folder deletion,
+        document uploads, metadata entry, and Open Document links.
+      </p>
+    </section>
+  </main>
+</body>
+</html>
