@@ -59,5 +59,5 @@ if ($LASTEXITCODE -ne 0) {
     & $RunPython -m pip install -r requirements.txt --break-system-packages
 }
 
-Write-Host "Starting Hector 2.3..."
+Write-Host "Starting Hector 2.7..."
 & $RunPython -m streamlit run app.py

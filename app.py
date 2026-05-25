@@ -61,6 +61,7 @@ DOCUMENT_COLUMNS = [
     "Subcategory",
 ]
 FOLDER_COLUMNS = ["Category", "Subcategory"]
+IMS_SYSTEM_FOLDERS = ["QMS", "EMS", "OHSMS"]
 SEARCH_COLUMNS = ["Document Name", "Code", "Department", "Keywords"]
 ALLOWED_UPLOAD_TYPES = ["pdf", "doc", "docx", "xls", "xlsx"]
 
@@ -86,11 +87,46 @@ def get_connection():
     return connection
 
 
+def ensure_nested_folder_schema(connection):
+    """Upgrade the folders table uniqueness rule for real nested folders."""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'folders'"
+    ).fetchone()
+    if row is None or "UNIQUE(category_id, name)" not in str(row["sql"]):
+        return
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        CREATE TABLE folders_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category_id INTEGER NOT NULL,
+            parent_folder_id INTEGER,
+            UNIQUE(category_id, parent_folder_id, name),
+            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_folder_id) REFERENCES folders_new(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO folders_new (id, name, category_id, parent_folder_id)
+        SELECT id, name, category_id, parent_folder_id
+        FROM folders
+        """
+    )
+    connection.execute("DROP TABLE folders")
+    connection.execute("ALTER TABLE folders_new RENAME TO folders")
+    connection.execute("PRAGMA foreign_keys = ON")
+
+
 def initialize_database():
     """Create Hector tables and seed default categories/folders safely."""
     DOCUMENT_FOLDER.mkdir(exist_ok=True)
 
     with get_connection() as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
         # Categories are the top-level Hector menu items.
         connection.execute(
             """
@@ -112,6 +148,21 @@ def initialize_database():
                 FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE,
                 FOREIGN KEY(parent_folder_id) REFERENCES folders(id) ON DELETE CASCADE
             )
+            """
+        )
+        ensure_nested_folder_schema(connection)
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_root_unique
+            ON folders(category_id, name)
+            WHERE parent_folder_id IS NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_child_unique
+            ON folders(parent_folder_id, name)
+            WHERE parent_folder_id IS NOT NULL
             """
         )
         # Documents store metadata and file paths only. Files remain in documents/.
@@ -136,6 +187,14 @@ def initialize_database():
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS document_relationships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 document_id INTEGER NOT NULL,
@@ -147,19 +206,51 @@ def initialize_database():
             """
         )
 
-        for category in MAIN_CATEGORIES:
-            connection.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
+        seeded = connection.execute(
+            "SELECT value FROM app_settings WHERE key = 'defaults_seeded'"
+        ).fetchone()
+        existing_categories = connection.execute("SELECT COUNT(*) AS count FROM categories").fetchone()["count"]
 
-        for category, folders in DEFAULT_FOLDERS.items():
-            category_id = get_category_id(connection, category)
-            for folder in folders:
+        if seeded is None and existing_categories == 0:
+            for category in MAIN_CATEGORIES:
+                connection.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
+
+            for category, folders in DEFAULT_FOLDERS.items():
+                category_id = get_category_id(connection, category)
+                for folder in folders:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO folders (name, category_id, parent_folder_id)
+                        VALUES (?, ?, NULL)
+                        """,
+                        (folder, category_id),
+                    )
+
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO app_settings (key, value)
+            VALUES ('defaults_seeded', 'true')
+            """
+        )
+        ims_systems_seeded = connection.execute(
+            "SELECT value FROM app_settings WHERE key = 'ims_systems_seeded'"
+        ).fetchone()
+        if ims_systems_seeded is None:
+            ims_category_id = get_category_id(connection, "IMS")
+            for folder in IMS_SYSTEM_FOLDERS:
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO folders (name, category_id, parent_folder_id)
                     VALUES (?, ?, NULL)
                     """,
-                    (folder, category_id),
+                    (folder, ims_category_id),
                 )
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO app_settings (key, value)
+                VALUES ('ims_systems_seeded', 'true')
+                """
+            )
 
     migrate_csv_to_sqlite()
 
@@ -222,6 +313,19 @@ def migrate_csv_to_sqlite():
     if not DOCUMENTS_CSV.exists():
         return
 
+    with get_connection() as connection:
+        migrated = connection.execute(
+            "SELECT value FROM app_settings WHERE key = 'csv_migrated'"
+        ).fetchone()
+        existing_documents = connection.execute("SELECT COUNT(*) AS count FROM documents").fetchone()["count"]
+        if migrated is not None:
+            return
+        if existing_documents > 0:
+            connection.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('csv_migrated', 'true')"
+            )
+            return
+
     with get_connection() as connection, DOCUMENTS_CSV.open(newline="", encoding="utf-8") as csv_file:
         for row in csv.DictReader(csv_file):
             document_name = clean_folder_name(row.get("Document Name", ""))
@@ -267,6 +371,9 @@ def migrate_csv_to_sqlite():
                     folder_id,
                 ),
             )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('csv_migrated', 'true')"
+        )
 
 
 def load_folders():
@@ -274,13 +381,135 @@ def load_folders():
     with get_connection() as connection:
         rows = connection.execute(
             """
-            SELECT folders.id, categories.name AS Category, folders.name AS Subcategory
+            SELECT
+                folders.id,
+                folders.parent_folder_id,
+                categories.name AS Category,
+                folders.name AS Subcategory
             FROM folders
             JOIN categories ON categories.id = folders.category_id
-            ORDER BY categories.name, folders.name
+            ORDER BY categories.name, folders.parent_folder_id, folders.name
             """
         ).fetchall()
-    return pd.DataFrame([dict(row) for row in rows], columns=["id", *FOLDER_COLUMNS]).fillna("")
+    return pd.DataFrame([dict(row) for row in rows], columns=["id", "parent_folder_id", *FOLDER_COLUMNS]).fillna("")
+
+
+def load_categories():
+    """Load main categories from SQLite so admin changes persist."""
+    with get_connection() as connection:
+        rows = connection.execute("SELECT id, name FROM categories ORDER BY name").fetchall()
+    return pd.DataFrame([dict(row) for row in rows], columns=["id", "name"]).fillna("")
+
+
+def get_category_name(category_id):
+    """Return a category name by id."""
+    with get_connection() as connection:
+        row = connection.execute("SELECT name FROM categories WHERE id = ?", (category_id,)).fetchone()
+    return "" if row is None else row["name"]
+
+
+def get_folder_row(folder_id):
+    """Return one folder row with its category name."""
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                folders.id,
+                folders.name,
+                folders.category_id,
+                folders.parent_folder_id,
+                categories.name AS category
+            FROM folders
+            JOIN categories ON categories.id = folders.category_id
+            WHERE folders.id = ?
+            """,
+            (int(folder_id),),
+        ).fetchone()
+
+
+def get_child_folders(category_id, parent_folder_id=None):
+    """Return folders directly under a category or parent folder."""
+    with get_connection() as connection:
+        if parent_folder_id is None:
+            rows = connection.execute(
+                """
+                SELECT id, name, category_id, parent_folder_id
+                FROM folders
+                WHERE category_id = ? AND parent_folder_id IS NULL
+                ORDER BY name
+                """,
+                (category_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT id, name, category_id, parent_folder_id
+                FROM folders
+                WHERE parent_folder_id = ?
+                ORDER BY name
+                """,
+                (int(parent_folder_id),),
+            ).fetchall()
+    return rows
+
+
+def get_folder_ancestors(folder_id):
+    """Return folders from root to the selected folder."""
+    folders = []
+    current_id = int(folder_id) if folder_id else None
+    with get_connection() as connection:
+        while current_id:
+            row = connection.execute(
+                """
+                SELECT id, name, category_id, parent_folder_id
+                FROM folders
+                WHERE id = ?
+                """,
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                break
+            folders.append(row)
+            current_id = row["parent_folder_id"]
+    return list(reversed(folders))
+
+
+def get_descendant_folder_ids(folder_id):
+    """Return a folder id and all nested child folder ids."""
+    folder_ids = [int(folder_id)]
+    with get_connection() as connection:
+        index = 0
+        while index < len(folder_ids):
+            rows = connection.execute(
+                "SELECT id FROM folders WHERE parent_folder_id = ?",
+                (folder_ids[index],),
+            ).fetchall()
+            folder_ids.extend(int(row["id"]) for row in rows)
+            index += 1
+    return folder_ids
+
+
+def folder_storage_path(category, folder_id):
+    """Build the physical storage path that mirrors the nested folder hierarchy."""
+    path = DOCUMENT_FOLDER / safe_path_part(category)
+    for folder in get_folder_ancestors(folder_id):
+        path = path / safe_path_part(folder["name"])
+    return path
+
+
+def root_folder_id(category, folder_name):
+    """Find a root folder id by category and name."""
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT folders.id
+            FROM folders
+            JOIN categories ON categories.id = folders.category_id
+            WHERE categories.name = ? AND folders.name = ? AND folders.parent_folder_id IS NULL
+            """,
+            (category, folder_name),
+        ).fetchone()
+    return None if row is None else int(row["id"])
 
 
 def save_folders(folders):
@@ -303,6 +532,7 @@ def load_documents():
                 documents.file_name AS "File Name",
                 documents.file_path AS "File Path",
                 categories.name AS Category,
+                documents.folder_id AS folder_id,
                 folders.name AS Subcategory
             FROM documents
             JOIN categories ON categories.id = documents.category_id
@@ -313,7 +543,7 @@ def load_documents():
 
     documents = pd.DataFrame([dict(row) for row in rows]).fillna("")
     if documents.empty:
-        return pd.DataFrame(columns=["id", *DOCUMENT_COLUMNS, "File Path"]).set_index("id", drop=False)
+        return pd.DataFrame(columns=["id", *DOCUMENT_COLUMNS, "File Path", "folder_id"]).set_index("id", drop=False)
     return documents.set_index("id", drop=False)
 
 
@@ -334,6 +564,34 @@ def documents_for_folder(documents, category, subcategory):
         (documents["Category"].astype(str) == category)
         & (documents["Subcategory"].astype(str) == subcategory)
     ]
+
+
+def documents_for_folder_id(documents, folder_id):
+    """Return documents that belong to one folder id."""
+    if documents.empty or "folder_id" not in documents.columns:
+        return documents.iloc[0:0]
+    return documents[documents["folder_id"].astype(str) == str(folder_id)]
+
+
+def documents_for_folder_tree(documents, folder_id):
+    """Return documents in a folder and all nested folders."""
+    if documents.empty or "folder_id" not in documents.columns:
+        return documents.iloc[0:0]
+    folder_ids = [str(folder_id) for folder_id in get_descendant_folder_ids(folder_id)]
+    return documents[documents["folder_id"].astype(str).isin(folder_ids)]
+
+
+def documents_for_category(documents, category):
+    """Return documents that belong to one main category."""
+    return documents[documents["Category"].astype(str) == category]
+
+
+def delete_physical_files(document_rows):
+    """Delete document files from disk when the user explicitly asks for it."""
+    for _, document in document_rows.iterrows():
+        path = get_document_path(document)
+        if path and path.exists():
+            path.unlink()
 
 
 def search_documents(documents, search_text):
@@ -366,11 +624,13 @@ def text_matches_query(text, query):
 
 def build_search_index():
     """Create one searchable list for categories, folders, and documents."""
+    categories = load_categories()
     folders = load_folders()
     documents = load_documents()
     results = []
 
-    for category in MAIN_CATEGORIES:
+    for _, category_row in categories.iterrows():
+        category = str(category_row["name"])
         results.append(
             {
                 "Type": "Main Category",
@@ -386,14 +646,17 @@ def build_search_index():
     for _, folder in folders.iterrows():
         category = str(folder["Category"])
         subcategory = str(folder["Subcategory"])
+        folder_id = int(folder["id"])
+        folder_path_text = " ".join([ancestor["name"] for ancestor in get_folder_ancestors(folder_id)])
         results.append(
             {
-                "Type": "Folder/Subcategory",
+                "Type": "Folder",
                 "Title": subcategory,
-                "Subtitle": f"{category} folder",
-                "Search Text": f"{category} {subcategory}",
+                "Subtitle": f"{category} / {' / '.join([ancestor['name'] for ancestor in get_folder_ancestors(folder_id)])}",
+                "Search Text": f"{category} {folder_path_text}",
                 "Category": category,
                 "Subcategory": subcategory,
+                "Folder ID": folder_id,
                 "Document Index": "",
             }
         )
@@ -402,6 +665,10 @@ def build_search_index():
         title = str(document["Document Name"])
         category = str(document["Category"])
         subcategory = str(document["Subcategory"])
+        folder_id = document.get("folder_id", "")
+        folder_path_text = ""
+        if str(folder_id).strip():
+            folder_path_text = " ".join([folder["name"] for folder in get_folder_ancestors(int(folder_id))])
         results.append(
             {
                 "Type": "Document",
@@ -415,10 +682,12 @@ def build_search_index():
                         str(document["Keywords"]),
                         category,
                         subcategory,
+                        folder_path_text,
                     ]
                 ),
                 "Category": category,
                 "Subcategory": subcategory,
+                "Folder ID": folder_id,
                 "Document Index": document_index,
             }
         )
@@ -479,11 +748,12 @@ def get_document_path(document):
     return None
 
 
-def insert_document_record(category, subcategory, metadata):
+def insert_document_record(category, subcategory, metadata, folder_id=None):
     """Insert one uploaded document into SQLite using parameterized SQL."""
     with get_connection() as connection:
         category_id = get_category_id(connection, category)
-        folder_id = get_folder_id(connection, category, subcategory)
+        if folder_id is None:
+            folder_id = get_folder_id(connection, category, subcategory)
         connection.execute(
             """
             INSERT OR IGNORE INTO documents (
@@ -506,7 +776,7 @@ def insert_document_record(category, subcategory, metadata):
 
 
 def apply_styles():
-    """Add Hector 2.3 full light theme restoration styling."""
+    """Add Hector 2.7 stable light theme styling."""
     st.markdown(
         """
         <style>
@@ -514,251 +784,227 @@ def apply_styles():
             --hector-bg: #F5F7FA;
             --hector-card: #FFFFFF;
             --hector-primary: #1E3A8A;
-            --hector-action: #2563EB;
+            --hector-button: #2563EB;
             --hector-text: #111827;
-            --hector-secondary: #4B5563;
+            --hector-muted: #4B5563;
             --hector-border: #E5E7EB;
             --hector-danger: #B91C1C;
         }
 
-        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
-            background: var(--hector-bg) !important;
-            color: var(--hector-text) !important;
-            font-family: Arial, sans-serif !important;
+        .stApp {
+            background: var(--hector-bg);
+            color: var(--hector-text);
         }
-        [data-testid="stHeader"], header {
-            background: rgba(245, 247, 250, 0) !important;
+        [data-testid="stHeader"] {
+            background: transparent;
         }
         .block-container {
             max-width: 1180px;
-            padding-top: 32px;
-            padding-bottom: 48px;
+            padding-top: 2rem;
+            padding-bottom: 3rem;
         }
 
-        h1, h2, h3, h4, h5, h6 {
-            color: var(--hector-primary) !important;
-            letter-spacing: 0 !important;
-            font-weight: 800 !important;
+        h1, h2, h3 {
+            color: var(--hector-primary);
+            font-weight: 800;
+            letter-spacing: 0;
         }
-        h1 { font-size: 42px !important; }
-        h2 { font-size: 28px !important; margin-top: 24px !important; }
-        h3 { font-size: 22px !important; }
-        p, label, span, div, li {
+        h1 { font-size: 2.5rem; }
+        h2 { font-size: 1.75rem; margin-top: 1.5rem; }
+        h3 { font-size: 1.25rem; }
+        p, label {
             color: var(--hector-text);
-            font-size: 17px;
+            font-size: 1rem;
             line-height: 1.5;
-        }
-        label, [data-testid="stWidgetLabel"] p {
-            color: var(--hector-text) !important;
-            font-size: 16px !important;
-            font-weight: 700 !important;
         }
 
         .hector-header {
             background: var(--hector-primary);
-            color: #FFFFFF;
-            padding: 30px;
             border-radius: 10px;
-            margin-bottom: 24px;
-            box-shadow: 0 8px 22px rgba(30, 58, 138, 0.16);
+            padding: 30px;
+            margin-bottom: 22px;
+            box-shadow: 0 8px 22px rgba(30, 58, 138, 0.14);
         }
         .hector-header h1 {
-            color: #FFFFFF !important;
-            margin: 0 !important;
-            font-size: 44px !important;
-            line-height: 1.1 !important;
+            color: #FFFFFF;
+            font-size: 2.75rem;
+            line-height: 1.1;
+            margin: 0;
         }
         .hector-header p {
-            color: #FFFFFF !important;
-            margin: 8px 0 0 0 !important;
-            font-size: 18px !important;
+            color: #FFFFFF;
+            font-size: 1.1rem;
+            margin: 8px 0 0 0;
         }
 
-        .document-card, .details-card, .category-card, .subcategory-card,
-        .placeholder-card, .search-result-card, [data-testid="stForm"] {
-            background: var(--hector-card) !important;
-            border: 1px solid var(--hector-border) !important;
-            border-radius: 10px !important;
-            padding: 18px !important;
-            margin: 14px 0 !important;
-            box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06) !important;
+        .category-card,
+        .subcategory-card,
+        .document-card,
+        .details-card,
+        .placeholder-card,
+        .search-result-card,
+        .admin-card {
+            background: var(--hector-card);
+            border: 1px solid var(--hector-border);
+            border-radius: 10px;
+            padding: 18px;
+            margin: 14px 0;
+            box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06);
         }
-        .category-card, .subcategory-card, .search-result-card {
-            min-height: 130px;
-            cursor: pointer;
+        .category-card,
+        .subcategory-card,
+        .search-result-card {
+            min-height: 120px;
         }
-        .search-result-card { min-height: 95px; }
-        .category-card:hover, .subcategory-card:hover, .search-result-card:hover {
-            border-color: var(--hector-action) !important;
-            box-shadow: 0 6px 18px rgba(37, 99, 235, 0.16) !important;
+        .category-card:hover,
+        .subcategory-card:hover,
+        .search-result-card:hover {
+            border-color: var(--hector-button);
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.12);
         }
-        .category-card h2, .subcategory-card h3, .details-card h2, .document-card h3 {
-            color: var(--hector-primary) !important;
+        .category-card h2,
+        .subcategory-card h3,
+        .document-card h3,
+        .details-card h2 {
+            color: var(--hector-primary);
+            margin-top: 0;
         }
-        .folder-icon { color: var(--hector-action); font-size: 30px; margin-bottom: 8px; }
-        .secondary-text, .stCaption, [data-testid="stCaptionContainer"],
+        .folder-icon {
+            color: var(--hector-button);
+            font-size: 1.3rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        .secondary-text,
         [data-testid="stCaptionContainer"] p {
-            color: var(--hector-secondary) !important;
+            color: var(--hector-muted);
         }
         .missing-file {
-            color: var(--hector-danger) !important;
-            font-weight: 700;
-            margin-top: 8px;
-        }
-        .breadcrumbs {
-            margin: -8px 0 18px 0;
-            color: var(--hector-secondary) !important;
-            font-size: 16px;
-        }
-        .breadcrumb-current {
-            color: var(--hector-text) !important;
+            color: var(--hector-danger);
             font-weight: 700;
         }
         .result-type {
             display: inline-block;
             background: #EFF6FF;
-            color: var(--hector-primary) !important;
+            color: var(--hector-primary);
             border: 1px solid #BFDBFE;
             border-radius: 999px;
             padding: 3px 10px;
-            font-size: 14px;
-            font-weight: 700;
+            font-size: 0.85rem;
+            font-weight: 800;
             margin-bottom: 8px;
         }
 
-        input, textarea, select, option,
+        .breadcrumb-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin: -6px 0 18px 0;
+            color: var(--hector-muted);
+        }
+        .breadcrumb-current {
+            color: var(--hector-text);
+            font-weight: 800;
+        }
+        .breadcrumb-separator {
+            color: var(--hector-muted);
+        }
+        .breadcrumb-spacer {
+            padding-top: 0.45rem;
+            color: var(--hector-muted);
+            text-align: center;
+        }
+
         div[data-testid="stTextInput"] input,
         div[data-testid="stTextArea"] textarea,
-        div[data-testid="stNumberInput"] input,
-        div[data-baseweb="input"] input,
-        div[data-baseweb="textarea"] textarea {
-            background: var(--hector-card) !important;
-            color: var(--hector-text) !important;
-            border-color: var(--hector-border) !important;
-            caret-color: var(--hector-text) !important;
-            font-size: 17px !important;
+        div[data-baseweb="select"] > div {
+            background-color: #FFFFFF;
+            color: var(--hector-text);
+            border-color: var(--hector-border);
+            border-radius: 8px;
         }
-        input::placeholder, textarea::placeholder {
-            color: #6B7280 !important;
-            opacity: 1 !important;
+        div[data-testid="stTextInput"] input::placeholder,
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #6B7280;
         }
-        input:focus, textarea:focus,
         div[data-testid="stTextInput"] input:focus,
         div[data-testid="stTextArea"] textarea:focus {
-            border-color: var(--hector-action) !important;
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16) !important;
-            outline: none !important;
+            border-color: var(--hector-button);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+        }
+        div[data-baseweb="popover"],
+        div[data-baseweb="menu"],
+        ul[role="listbox"] {
+            background-color: #FFFFFF;
+            color: var(--hector-text);
+            border: 1px solid var(--hector-border);
+            border-radius: 8px;
+        }
+        li[role="option"],
+        div[role="option"] {
+            color: var(--hector-text);
+            background-color: #FFFFFF;
+        }
+        li[role="option"]:hover,
+        div[role="option"]:hover {
+            background-color: #EFF6FF;
+            color: var(--hector-primary);
         }
 
-        div[data-testid="stSelectbox"],
-        div[data-baseweb="select"],
-        div[data-baseweb="select"] > div,
-        div[data-baseweb="select"] div,
-        div[data-baseweb="select"] input {
-            background: var(--hector-card) !important;
-            color: var(--hector-text) !important;
-            border-color: var(--hector-border) !important;
+        div[data-testid="stFileUploader"] section {
+            background-color: #FFFFFF;
+            border-color: var(--hector-border);
+            border-radius: 10px;
         }
-        div[data-baseweb="select"] svg {
-            fill: var(--hector-secondary) !important;
-            color: var(--hector-secondary) !important;
+        div[data-testid="stForm"] {
+            background-color: #FFFFFF;
+            border: 1px solid var(--hector-border);
+            border-radius: 10px;
+            padding: 18px;
+            box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06);
         }
-        [data-baseweb="popover"], [data-baseweb="popover"] *,
-        [data-baseweb="menu"], [data-baseweb="menu"] *,
-        ul[role="listbox"], ul[role="listbox"] *,
-        div[role="listbox"], div[role="listbox"] *,
-        li[role="option"], div[role="option"] {
-            background: var(--hector-card) !important;
-            color: var(--hector-text) !important;
-            border-color: var(--hector-border) !important;
-        }
-        li[role="option"]:hover, div[role="option"]:hover,
-        li[aria-selected="true"], div[aria-selected="true"] {
-            background: #EFF6FF !important;
-            color: var(--hector-primary) !important;
-        }
-
-        [data-testid="stFileUploader"] section,
-        [data-testid="stFileUploader"] section *,
-        [data-testid="stFileUploaderDropzone"],
-        [data-testid="stFileUploaderDropzone"] * {
-            background: var(--hector-card) !important;
-            color: var(--hector-text) !important;
-            border-color: var(--hector-border) !important;
-        }
-        [data-testid="stFileUploader"] small,
-        [data-testid="stFileUploader"] span {
-            color: var(--hector-secondary) !important;
-        }
-
-        [data-testid="stCheckbox"], [data-testid="stCheckbox"] *,
-        [data-testid="stCheckbox"] label, [data-testid="stCheckbox"] p {
-            color: var(--hector-text) !important;
-            background: transparent !important;
-        }
-        [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] p {
-            font-weight: 600 !important;
+        div[data-testid="stCheckbox"] label {
+            color: var(--hector-text);
         }
 
         .stButton > button,
         .stDownloadButton > button,
-        button[kind="secondary"],
-        div[data-testid="stFormSubmitButton"] button,
-        [data-testid="stFileUploader"] button {
-            background: var(--hector-action) !important;
-            color: #FFFFFF !important;
-            border: 1px solid var(--hector-action) !important;
-            border-radius: 8px !important;
-            padding: 10px 16px !important;
-            font-size: 16px !important;
-            font-weight: 700 !important;
-            box-shadow: none !important;
-            cursor: pointer !important;
+        div[data-testid="stFormSubmitButton"] button {
+            background-color: var(--hector-button);
+            color: #FFFFFF;
+            border: 1px solid var(--hector-button);
+            border-radius: 8px;
+            font-weight: 800;
+            padding: 0.55rem 1rem;
         }
         .stButton > button:hover,
         .stDownloadButton > button:hover,
-        button[kind="secondary"]:hover,
-        div[data-testid="stFormSubmitButton"] button:hover,
-        [data-testid="stFileUploader"] button:hover {
-            background: var(--hector-primary) !important;
-            border-color: var(--hector-primary) !important;
-            color: #FFFFFF !important;
+        div[data-testid="stFormSubmitButton"] button:hover {
+            background-color: var(--hector-primary);
+            border-color: var(--hector-primary);
+            color: #FFFFFF;
         }
-        .stButton > button *,
-        .stDownloadButton > button *,
-        div[data-testid="stFormSubmitButton"] button *,
-        [data-testid="stFileUploader"] button * {
-            color: #FFFFFF !important;
-            font-size: 16px !important;
-            font-weight: 700 !important;
+        .stButton > button p,
+        .stDownloadButton > button p,
+        div[data-testid="stFormSubmitButton"] button p {
+            color: #FFFFFF;
+            font-weight: 800;
         }
         button[kind="primary"] {
-            background: var(--hector-danger) !important;
-            color: #FFFFFF !important;
-            border: 1px solid var(--hector-danger) !important;
-            border-radius: 8px !important;
-            padding: 10px 16px !important;
-            font-size: 16px !important;
-            font-weight: 800 !important;
+            background-color: var(--hector-danger);
+            border-color: var(--hector-danger);
         }
         button[kind="primary"]:hover {
-            background: #7F1D1D !important;
-            border-color: #7F1D1D !important;
-            color: #FFFFFF !important;
-        }
-        button[kind="primary"] * {
-            color: #FFFFFF !important;
-            font-weight: 800 !important;
+            background-color: #7F1D1D;
+            border-color: #7F1D1D;
         }
 
-        .stAlert, [data-testid="stAlert"] {
-            background: var(--hector-card) !important;
-            border: 1px solid var(--hector-border) !important;
-            color: var(--hector-text) !important;
-            border-radius: 8px !important;
-        }
-        [data-testid="stAlert"] * {
-            color: var(--hector-text) !important;
+        div[data-testid="stAlert"] {
+            background-color: #FFFFFF;
+            border: 1px solid var(--hector-border);
+            border-radius: 8px;
+            color: var(--hector-text);
         }
         </style>
         """,
@@ -784,6 +1030,7 @@ def show_breadcrumbs(items):
     if not items:
         return
 
+    st.markdown("<div class='breadcrumb-bar'>", unsafe_allow_html=True)
     columns = st.columns([1] * (len(items) * 2 - 1))
 
     for index, item in enumerate(items):
@@ -791,7 +1038,7 @@ def show_breadcrumbs(items):
         with columns[column_index]:
             if index == len(items) - 1:
                 st.markdown(
-                    f"<div class='breadcrumbs breadcrumb-current'>{html.escape(item['label'])}</div>",
+                    f"<span class='breadcrumb-current'>{html.escape(item['label'])}</span>",
                     unsafe_allow_html=True,
                 )
             else:
@@ -801,7 +1048,8 @@ def show_breadcrumbs(items):
 
         if index < len(items) - 1:
             with columns[column_index + 1]:
-                st.markdown("<div class='breadcrumbs'>/</div>", unsafe_allow_html=True)
+                st.markdown("<div class='breadcrumb-spacer'>/</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def go_home():
@@ -817,6 +1065,20 @@ def go_to_folder(category, subcategory):
     st.session_state.page = "Folder"
     st.session_state.category = category
     st.session_state.subcategory = subcategory
+    folder_id = root_folder_id(category, subcategory)
+    if folder_id is not None:
+        st.session_state.folder_id = folder_id
+
+
+def go_to_folder_id(folder_id):
+    folder = get_folder_row(folder_id)
+    if folder is None:
+        go_home()
+        return
+    st.session_state.page = "Folder"
+    st.session_state.category = folder["category"]
+    st.session_state.subcategory = folder["name"]
+    st.session_state.folder_id = int(folder["id"])
 
 
 def go_to_admin():
@@ -865,10 +1127,10 @@ def show_search_result(item, documents):
         if st.button(f"Open {item['Title']}", key=f"search-category-{item['Title']}"):
             go_to_category(item["Category"])
             st.rerun()
-    elif item["Type"] == "Folder/Subcategory":
-        button_label = f"Open {item['Category']} / {item['Subcategory']}"
-        if st.button(button_label, key=f"search-folder-{item['Category']}-{item['Subcategory']}"):
-            go_to_folder(item["Category"], item["Subcategory"])
+    elif item["Type"] == "Folder":
+        button_label = f"Open {item['Title']}"
+        if st.button(button_label, key=f"search-folder-{item['Folder ID']}"):
+            go_to_folder_id(item["Folder ID"])
             st.rerun()
     else:
         document = documents.loc[int(item["Document Index"])]
@@ -880,7 +1142,7 @@ def show_search_result(item, documents):
 
 def show_home_page():
     """Show the Hector home page with global search, categories, and admin access."""
-    show_header("Hector 2.3", "Search all documents, folders, and categories.")
+    show_header("Hector 2.7", "Search all documents, folders, and categories.")
     show_breadcrumbs([{"label": "Home", "action": go_home}])
 
     st.markdown("## Global Document Search")
@@ -904,22 +1166,30 @@ def show_home_page():
                 show_search_result(item, documents)
 
     st.markdown("## Main Categories")
-    columns = st.columns(4)
+    all_categories = load_categories()["name"].astype(str).tolist()
+    categories = ["IMS"] if "IMS" in all_categories else []
 
-    for index, category in enumerate(MAIN_CATEGORIES):
-        with columns[index]:
-            st.markdown(
-                f"""
-                <div class="category-card">
-                    <h2>{html.escape(category)}</h2>
-                    <p class="secondary-text">Open {html.escape(category)}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button(f"Open {category}", key=f"open-{category}"):
-                go_to_category(category)
-                st.rerun()
+    if not categories:
+        st.info("No main categories have been added yet. Use Admin / Manage Folders to add IMS.")
+    else:
+        for row_start in range(0, len(categories), 4):
+            columns = st.columns(4)
+            row_categories = categories[row_start : row_start + 4]
+
+            for index, category in enumerate(row_categories):
+                with columns[index]:
+                    st.markdown(
+                        f"""
+                        <div class="category-card">
+                            <h2>{html.escape(category)}</h2>
+                            <p class="secondary-text">Open {html.escape(category)}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(f"Open {category}", key=f"open-{category}"):
+                        go_to_category(category)
+                        st.rerun()
 
     st.markdown("## Admin")
     if st.button("Admin / Manage Folders"):
@@ -929,6 +1199,12 @@ def show_home_page():
 
 def show_category_page(category):
     """Show subfolders for a main category."""
+    categories = load_categories()["name"].astype(str).tolist()
+    if category not in categories:
+        st.warning("This category no longer exists. Returning to Home.")
+        go_home()
+        st.rerun()
+
     if st.button("Back to Home"):
         go_home()
         st.rerun()
@@ -941,19 +1217,25 @@ def show_category_page(category):
         ]
     )
 
-    folders = load_folders()
-    subcategories = folders[folders["Category"] == category]["Subcategory"].tolist()
+    with get_connection() as connection:
+        category_row = connection.execute("SELECT id FROM categories WHERE name = ?", (category,)).fetchone()
+    if category_row is None:
+        st.warning("This category no longer exists. Returning to Home.")
+        go_home()
+        st.rerun()
 
-    if not subcategories:
+    root_folders = get_child_folders(category_row["id"], None)
+
+    if not root_folders:
         st.info("No folders have been added yet. Use Admin / Manage Folders to add one.")
         return
 
-    # Later, connect category-specific folder groups here if needed.
-    for row_start in range(0, len(subcategories), 4):
+    for row_start in range(0, len(root_folders), 4):
         columns = st.columns(4)
-        row_subcategories = subcategories[row_start : row_start + 4]
+        row_subcategories = root_folders[row_start : row_start + 4]
 
-        for index, subcategory in enumerate(row_subcategories):
+        for index, folder in enumerate(row_subcategories):
+            subcategory = folder["name"]
             with columns[index]:
                 st.markdown(
                     f"""
@@ -966,15 +1248,20 @@ def show_category_page(category):
                     unsafe_allow_html=True,
                 )
                 if st.button(f"Open {subcategory}", key=f"open-{category}-{subcategory}"):
-                    go_to_folder(category, subcategory)
+                    go_to_folder_id(folder["id"])
                     st.rerun()
 
 
-def show_upload_form(category, subcategory):
+def show_upload_form(category, folder_id):
     """Allow users to upload documents into a selected folder."""
     st.markdown("### Upload Document")
+    folder = get_folder_row(folder_id)
+    if folder is None:
+        st.error("Folder not found.")
+        return
+    subcategory = folder["name"]
 
-    with st.form(f"upload-{category}-{subcategory}", clear_on_submit=True):
+    with st.form(f"upload-{category}-{folder_id}", clear_on_submit=True):
         uploaded_file = st.file_uploader(
             "Choose a PDF, Word, or Excel file",
             type=ALLOWED_UPLOAD_TYPES,
@@ -997,7 +1284,7 @@ def show_upload_form(category, subcategory):
         st.error("Please enter a document name.")
         return
 
-    target_folder = folder_path(category, subcategory)
+    target_folder = folder_storage_path(category, folder_id)
     target_folder.mkdir(parents=True, exist_ok=True)
     safe_file_name = safe_path_part(uploaded_file.name)
     target_path = target_folder / safe_file_name
@@ -1024,7 +1311,7 @@ def show_upload_form(category, subcategory):
         "Category": category,
         "Subcategory": subcategory,
     }
-    insert_document_record(category, subcategory, new_document)
+    insert_document_record(category, subcategory, new_document, folder_id=folder_id)
     st.success("Document uploaded successfully.")
 
 
@@ -1044,10 +1331,10 @@ def show_document_card(document, key_prefix):
     open_document_link(document)
 
 
-def show_folder_documents(category, subcategory):
+def show_folder_documents(folder_id):
     """Show uploaded documents that belong to the current folder."""
     documents = load_documents()
-    folder_documents = documents_for_folder(documents, category, subcategory)
+    folder_documents = documents_for_folder_id(documents, folder_id)
 
     st.markdown("### Documents")
 
@@ -1059,24 +1346,153 @@ def show_folder_documents(category, subcategory):
         show_document_card(document, f"folder-{index}")
 
 
-def show_folder_page(category, subcategory):
-    """Show one folder/subcategory page with upload and document list."""
-    if st.button(f"Back to {category}"):
-        go_to_category(category)
+def show_create_subfolder_form(folder):
+    """Create a child folder under the current folder."""
+    st.markdown("### Create Subfolder")
+    with st.form(f"create-subfolder-{folder['id']}", clear_on_submit=True):
+        new_folder = st.text_input("Subfolder name")
+        submitted = st.form_submit_button("Create Subfolder")
+
+    if not submitted:
+        return
+
+    folder_name = clean_folder_name(new_folder)
+    if not folder_name:
+        st.error("Please enter a subfolder name.")
+        return
+
+    try:
+        with get_connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO folders (name, category_id, parent_folder_id)
+                VALUES (?, ?, ?)
+                """,
+                (folder_name, folder["category_id"], folder["id"]),
+            )
+            new_folder_id = cursor.lastrowid
+        folder_storage_path(folder["category"], new_folder_id).mkdir(parents=True, exist_ok=True)
+        st.success("Subfolder created.")
+        st.rerun()
+    except sqlite3.IntegrityError:
+        st.warning("A folder with this name already exists here.")
+    except sqlite3.Error as error:
+        st.error(f"Database error: {error}")
+
+
+def show_child_folders(folder):
+    """Show and manage direct child folders."""
+    child_folders = get_child_folders(folder["category_id"], folder["id"])
+    st.markdown("### Subfolders")
+
+    if not child_folders:
+        st.info("No subfolders have been added yet.")
+    else:
+        for row_start in range(0, len(child_folders), 4):
+            columns = st.columns(4)
+            row_folders = child_folders[row_start : row_start + 4]
+            for index, child in enumerate(row_folders):
+                with columns[index]:
+                    st.markdown(
+                        f"""
+                        <div class="subcategory-card">
+                            <div class="folder-icon">Folder</div>
+                            <h3>{html.escape(child["name"])}</h3>
+                            <p class="secondary-text">Open folder</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(f"Open {child['name']}", key=f"open-child-{child['id']}"):
+                        go_to_folder_id(child["id"])
+                        st.rerun()
+
+    if not child_folders:
+        return
+
+    st.markdown("### Delete Subfolder")
+    child_options = {child["name"]: child for child in child_folders}
+    selected_name = st.selectbox(
+        "Subfolder to delete",
+        list(child_options.keys()),
+        key=f"delete-child-select-{folder['id']}",
+    )
+    selected_child = child_options[selected_name]
+
+    documents = load_documents()
+    selected_documents = documents_for_folder_tree(documents, selected_child["id"])
+    selected_children = get_child_folders(selected_child["category_id"], selected_child["id"])
+    if selected_documents.empty and not selected_children:
+        st.info("This subfolder does not contain documents or subfolders.")
+    else:
+        st.warning("This subfolder contains folders/documents. Are you sure you want to delete it?")
+
+    confirm_delete = st.checkbox(
+        "I understand and want to delete this subfolder.",
+        key=f"confirm-child-delete-{folder['id']}",
+    )
+    delete_files = st.checkbox(
+        "Also delete physical document files in this subfolder.",
+        key=f"delete-child-files-{folder['id']}",
+    )
+
+    if st.button("Delete Subfolder", type="primary", key=f"delete-child-button-{folder['id']}"):
+        if not confirm_delete:
+            st.error("Please confirm before deleting this subfolder.")
+            return
+
+        if delete_files:
+            delete_physical_files(selected_documents)
+            target_folder = folder_storage_path(folder["category"], selected_child["id"])
+            if target_folder.exists():
+                shutil.rmtree(target_folder)
+
+        with get_connection() as connection:
+            descendant_ids = get_descendant_folder_ids(selected_child["id"])
+            placeholders = ",".join("?" for _ in descendant_ids)
+            connection.execute(f"DELETE FROM documents WHERE folder_id IN ({placeholders})", descendant_ids)
+            connection.execute("DELETE FROM folders WHERE id = ?", (selected_child["id"],))
+
+        st.success("Subfolder deleted.")
         st.rerun()
 
-    show_header(subcategory, "Documents for this subcategory will be added here.")
-    show_breadcrumbs(
-        [
-            {"label": "Home", "action": go_home},
-            {"label": category, "action": lambda: go_to_category(category)},
-            {"label": subcategory, "action": lambda: go_to_folder(category, subcategory)},
-        ]
-    )
-    show_upload_form(category, subcategory)
-    show_folder_documents(category, subcategory)
 
-    # Later, connect more document workflow fields for this folder here.
+def show_folder_page(folder_id):
+    """Show one nested folder page with subfolders, upload, and document list."""
+    folder = get_folder_row(folder_id)
+    if folder is None:
+        st.warning("This folder no longer exists. Returning to Home.")
+        go_home()
+        st.rerun()
+
+    category = folder["category"]
+    subcategory = folder["name"]
+    ancestors = get_folder_ancestors(folder_id)
+
+    if st.button(f"Back to {category}"):
+        parent_id = folder["parent_folder_id"]
+        if parent_id:
+            go_to_folder_id(parent_id)
+        else:
+            go_to_category(category)
+        st.rerun()
+
+    show_header(subcategory, "Folders and documents.")
+    breadcrumb_items = [
+        {"label": "Home", "action": go_home},
+        {"label": category, "action": lambda: go_to_category(category)},
+    ]
+    for ancestor in ancestors:
+        ancestor_id = int(ancestor["id"])
+        breadcrumb_items.append(
+            {"label": ancestor["name"], "action": lambda folder_id=ancestor_id: go_to_folder_id(folder_id)}
+        )
+    show_breadcrumbs(breadcrumb_items)
+
+    show_create_subfolder_form(folder)
+    show_child_folders(folder)
+    show_upload_form(category, folder_id)
+    show_folder_documents(folder_id)
 
 
 def show_related_documents(documents, document):
@@ -1108,18 +1524,22 @@ def show_document_page(document_index):
 
     document = documents.loc[document_index]
     category = str(document["Category"])
-    subcategory = str(document["Subcategory"])
     document_name = str(document["Document Name"])
 
     show_header(document_name, "Document details.")
-    show_breadcrumbs(
-        [
-            {"label": "Home", "action": go_home},
-            {"label": category, "action": lambda: go_to_category(category)},
-            {"label": subcategory, "action": lambda: go_to_folder(category, subcategory)},
-            {"label": document_name, "action": lambda: go_to_document(document_index)},
-        ]
-    )
+    breadcrumb_items = [
+        {"label": "Home", "action": go_home},
+        {"label": category, "action": lambda: go_to_category(category)},
+    ]
+    folder_id = document.get("folder_id", "")
+    if str(folder_id).strip():
+        for folder in get_folder_ancestors(int(folder_id)):
+            ancestor_id = int(folder["id"])
+            breadcrumb_items.append(
+                {"label": folder["name"], "action": lambda folder_id=ancestor_id: go_to_folder_id(folder_id)}
+            )
+    breadcrumb_items.append({"label": document_name, "action": lambda: go_to_document(document_index)})
+    show_breadcrumbs(breadcrumb_items)
     show_document_details(documents, document)
 
 
@@ -1147,19 +1567,90 @@ def show_admin_page():
         go_home()
         st.rerun()
 
-    show_header("Admin / Manage Folders", "Create and delete Hector folders.")
+    show_header("Admin / Manage Folders", "Create and delete Hector categories and folders.")
     show_breadcrumbs(
         [
             {"label": "Home", "action": go_home},
             {"label": "Admin / Manage Folders", "action": go_to_admin},
         ]
     )
+    categories = load_categories()
+    category_names = categories["name"].astype(str).tolist()
     folders = load_folders()
     documents = load_documents()
 
+    st.markdown("## Manage Main Categories")
+    st.markdown('<div class="admin-card">', unsafe_allow_html=True)
+    with st.form("add-main-category", clear_on_submit=True):
+        new_category = st.text_input("New main category name")
+        add_category_submitted = st.form_submit_button("Add Main Category")
+
+    if add_category_submitted:
+        category_name = clean_folder_name(new_category)
+        if not category_name:
+            st.error("Please enter a main category name.")
+        else:
+            try:
+                with get_connection() as connection:
+                    connection.execute("INSERT INTO categories (name) VALUES (?)", (category_name,))
+                st.success("Main category added.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.warning("That main category already exists.")
+            except sqlite3.Error as error:
+                st.error(f"Database error: {error}")
+
+    if category_names:
+        selected_category_to_delete = st.selectbox(
+            "Main category to delete",
+            category_names,
+            key="delete-main-category",
+        )
+        category_folders = folders[folders["Category"].astype(str) == selected_category_to_delete]
+        category_documents = documents_for_category(documents, selected_category_to_delete)
+
+        if category_folders.empty and category_documents.empty:
+            st.info("This category does not contain folders or documents.")
+        else:
+            st.warning("This category contains folders/documents. Are you sure you want to delete it?")
+
+        confirm_category_delete = st.checkbox(
+            "I understand and want to delete this main category.",
+            key="confirm-category-delete",
+        )
+        delete_category_files = st.checkbox(
+            "Also delete physical document files in this category.",
+            key="delete-category-files",
+        )
+
+        if st.button("Delete Main Category", type="primary"):
+            if not confirm_category_delete:
+                st.error("Please confirm before deleting this main category.")
+            else:
+                if delete_category_files:
+                    delete_physical_files(category_documents)
+                    target_category_folder = DOCUMENT_FOLDER / safe_path_part(selected_category_to_delete)
+                    if target_category_folder.exists():
+                        shutil.rmtree(target_category_folder)
+
+                with get_connection() as connection:
+                    connection.execute("DELETE FROM categories WHERE name = ?", (selected_category_to_delete,))
+
+                if st.session_state.category == selected_category_to_delete:
+                    go_home()
+                st.success("Main category deleted.")
+                st.rerun()
+    else:
+        st.info("There are no main categories to delete.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown("## Add Folder")
+    if not category_names:
+        st.info("Add a main category before adding folders.")
+        return
+
     with st.form("add-folder", clear_on_submit=True):
-        category = st.selectbox("Main category", MAIN_CATEGORIES)
+        category = st.selectbox("Main category", category_names)
         new_folder = st.text_input("New folder/subcategory name")
         submitted = st.form_submit_button("Add Folder")
 
@@ -1172,14 +1663,15 @@ def show_admin_page():
             try:
                 with get_connection() as connection:
                     category_id = get_category_id(connection, category)
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         INSERT INTO folders (name, category_id, parent_folder_id)
                         VALUES (?, ?, NULL)
                         """,
                         (folder_name, category_id),
                     )
-                folder_path(category, folder_name).mkdir(parents=True, exist_ok=True)
+                    new_folder_id = cursor.lastrowid
+                folder_storage_path(category, new_folder_id).mkdir(parents=True, exist_ok=True)
                 st.success("Folder added.")
                 st.rerun()
             except sqlite3.IntegrityError:
@@ -1192,10 +1684,20 @@ def show_admin_page():
         st.info("There are no folders to delete.")
         return
 
-    folder_labels = [f"{row['Category']} / {row['Subcategory']}" for _, row in folders.iterrows()]
-    selected_label = st.selectbox("Folder to delete", folder_labels)
-    selected_category, selected_subcategory = selected_label.split(" / ", 1)
-    folder_documents = documents_for_folder(documents, selected_category, selected_subcategory)
+    folder_options = {}
+    for _, row in folders.iterrows():
+        folder_id = int(row["id"])
+        path_parts = [ancestor["name"] for ancestor in get_folder_ancestors(folder_id)]
+        label = f"{row['Category']} / {' / '.join(path_parts)}"
+        folder_options[label] = folder_id
+
+    selected_label = st.selectbox("Folder to delete", list(folder_options.keys()))
+    selected_folder_id = folder_options[selected_label]
+    selected_folder = get_folder_row(selected_folder_id)
+    selected_category = selected_folder["category"]
+    selected_subcategory = selected_folder["name"]
+    selected_physical_folder = folder_storage_path(selected_category, selected_folder_id)
+    folder_documents = documents_for_folder_tree(documents, selected_folder_id)
 
     if folder_documents.empty:
         st.info("This folder does not contain documents.")
@@ -1215,29 +1717,21 @@ def show_admin_page():
             return
 
         with get_connection() as connection:
-            category_id = get_category_id(connection, selected_category)
-            folder_row = connection.execute(
-                "SELECT id FROM folders WHERE name = ? AND category_id = ?",
-                (selected_subcategory, category_id),
-            ).fetchone()
-
-            if folder_row and delete_files:
-                connection.execute("DELETE FROM documents WHERE folder_id = ?", (folder_row["id"],))
-
-            if folder_row:
-                connection.execute("DELETE FROM folders WHERE id = ?", (folder_row["id"],))
+            descendant_ids = get_descendant_folder_ids(selected_folder_id)
+            placeholders = ",".join("?" for _ in descendant_ids)
+            connection.execute(f"DELETE FROM documents WHERE folder_id IN ({placeholders})", descendant_ids)
+            connection.execute("DELETE FROM folders WHERE id = ?", (selected_folder_id,))
 
         if delete_files:
-            target_folder = folder_path(selected_category, selected_subcategory)
-            if target_folder.exists():
-                shutil.rmtree(target_folder)
+            if selected_physical_folder.exists():
+                shutil.rmtree(selected_physical_folder)
 
         st.success("Folder deleted.")
         st.rerun()
 
 
 def main():
-    st.set_page_config(page_title="Hector 2.3", layout="wide")
+    st.set_page_config(page_title="Hector 2.7", layout="wide")
     ensure_storage()
     apply_styles()
 
@@ -1247,6 +1741,8 @@ def main():
         st.session_state.category = ""
     if "subcategory" not in st.session_state:
         st.session_state.subcategory = ""
+    if "folder_id" not in st.session_state:
+        st.session_state.folder_id = 0
     if "document_index" not in st.session_state:
         st.session_state.document_index = 0
 
@@ -1255,7 +1751,7 @@ def main():
     elif st.session_state.page == "Category":
         show_category_page(st.session_state.category)
     elif st.session_state.page == "Folder":
-        show_folder_page(st.session_state.category, st.session_state.subcategory)
+        show_folder_page(st.session_state.folder_id)
     elif st.session_state.page == "Admin":
         show_admin_page()
     elif st.session_state.page == "Document":
