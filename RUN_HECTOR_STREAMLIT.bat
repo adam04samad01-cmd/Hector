@@ -65,6 +65,6 @@ if errorlevel 1 (
   "%RUN_PYTHON%" -m pip install -r requirements.txt --break-system-packages
 )
 
-echo Starting Hector 2.7...
+echo Starting Hector 2.8...
 "%RUN_PYTHON%" -m streamlit run app.py
 pause

@@ -205,36 +205,6 @@ def initialize_database():
             )
             """
         )
-        # Sync logs keep an audit trail for manual REWORKED imports.
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                synced_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                source_folder_path TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                folders_created INTEGER DEFAULT 0,
-                files_imported INTEGER DEFAULT 0,
-                files_skipped INTEGER DEFAULT 0,
-                errors TEXT
-            )
-            """
-        )
-        # Imported source fingerprints help prevent importing the same REWORKED file twice.
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS document_imports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER,
-                source_path TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(source_path, file_name, file_size),
-                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE SET NULL
-            )
-            """
-        )
 
         seeded = connection.execute(
             "SELECT value FROM app_settings WHERE key = 'defaults_seeded'"
@@ -527,14 +497,6 @@ def folder_storage_path(category, folder_id):
     return path
 
 
-def folder_storage_path_from_parts(category, folder_parts):
-    """Build a physical storage path from scanned REWORKED folder names."""
-    path = DOCUMENT_FOLDER / safe_path_part(category)
-    for folder_part in folder_parts:
-        path = path / safe_path_part(folder_part)
-    return path
-
-
 def root_folder_id(category, folder_name):
     """Find a root folder id by category and name."""
     with get_connection() as connection:
@@ -813,242 +775,8 @@ def insert_document_record(category, subcategory, metadata, folder_id=None):
         )
 
 
-def is_allowed_document_file(path):
-    """Return True for file types Hector can import from REWORKED."""
-    return path.is_file() and path.suffix.lower().lstrip(".") in ALLOWED_UPLOAD_TYPES
-
-
-def existing_folder_paths(category):
-    """Return existing folder paths as tuples like ('IMS', 'QMS', 'Contracts')."""
-    paths = set()
-    for _, folder in load_folders().iterrows():
-        if str(folder["Category"]) != category:
-            continue
-        folder_path_tuple = tuple([category] + [row["name"] for row in get_folder_ancestors(int(folder["id"]))])
-        paths.add(folder_path_tuple)
-    return paths
-
-
-def get_or_create_nested_folder(connection, category, folder_parts):
-    """Create missing nested folders and return the final folder id plus created count."""
-    category_id = get_category_id(connection, category)
-    parent_id = None
-    created_count = 0
-
-    for folder_name in folder_parts:
-        folder_name = clean_folder_name(folder_name)
-        if not folder_name:
-            continue
-
-        if parent_id is None:
-            row = connection.execute(
-                """
-                SELECT id FROM folders
-                WHERE category_id = ? AND parent_folder_id IS NULL AND name = ?
-                """,
-                (category_id, folder_name),
-            ).fetchone()
-        else:
-            row = connection.execute(
-                """
-                SELECT id FROM folders
-                WHERE parent_folder_id = ? AND name = ?
-                """,
-                (parent_id, folder_name),
-            ).fetchone()
-
-        if row is None:
-            cursor = connection.execute(
-                """
-                INSERT INTO folders (name, category_id, parent_folder_id)
-                VALUES (?, ?, ?)
-                """,
-                (folder_name, category_id, parent_id),
-            )
-            parent_id = cursor.lastrowid
-            created_count += 1
-        else:
-            parent_id = row["id"]
-
-    return parent_id, created_count
-
-
-def scan_reworked_folder(source_folder):
-    """Preview a REWORKED folder without changing Hector data."""
-    source_root = Path(source_folder).expanduser()
-    report = {"folders": [], "files": [], "duplicates": [], "invalid": [], "errors": []}
-
-    if not source_root.exists() or not source_root.is_dir():
-        report["errors"].append("REWORKED path is invalid or is not a folder.")
-        return report
-
-    existing_paths = existing_folder_paths("IMS")
-    folders_to_create = set()
-
-    with get_connection() as connection:
-        for source_file in source_root.rglob("*"):
-            if not source_file.is_file():
-                continue
-
-            try:
-                relative_parts = source_file.relative_to(source_root).parts
-                file_size = source_file.stat().st_size
-            except OSError as error:
-                report["errors"].append(f"{source_file}: {error}")
-                continue
-
-            if len(relative_parts) < 3 or relative_parts[0].upper() != "IMS":
-                report["invalid"].append(f"{source_file} - expected REWORKED/IMS/QMS, EMS, or OHSMS structure.")
-                continue
-
-            if not is_allowed_document_file(source_file):
-                report["invalid"].append(f"{source_file} - unsupported file type.")
-                continue
-
-            category = "IMS"
-            folder_parts = [clean_folder_name(part) for part in relative_parts[1:-1] if clean_folder_name(part)]
-            if not folder_parts:
-                report["invalid"].append(f"{source_file} - file must be inside an IMS system folder.")
-                continue
-
-            source_path = str(source_file.resolve())
-            duplicate = connection.execute(
-                """
-                SELECT id FROM document_imports
-                WHERE source_path = ? AND file_name = ? AND file_size = ?
-                """,
-                (source_path, source_file.name, file_size),
-            ).fetchone()
-
-            target_path = DOCUMENT_FOLDER / safe_path_part(category)
-            for folder_part in folder_parts:
-                target_path = target_path / safe_path_part(folder_part)
-            target_file = target_path / safe_path_part(source_file.name)
-
-            file_item = {
-                "source_path": source_path,
-                "relative_path": str(Path(*relative_parts)),
-                "category": category,
-                "folder_parts": folder_parts,
-                "file_name": source_file.name,
-                "file_size": file_size,
-                "target_path": str(target_file),
-            }
-
-            if duplicate or target_file.exists():
-                report["duplicates"].append(file_item)
-                continue
-
-            for index in range(1, len(folder_parts) + 1):
-                folder_tuple = tuple([category] + folder_parts[:index])
-                if folder_tuple not in existing_paths:
-                    folders_to_create.add(folder_tuple)
-
-            report["files"].append(file_item)
-
-    report["folders"] = sorted([" / ".join(folder) for folder in folders_to_create])
-    return report
-
-
-def import_reworked_scan(report, source_folder):
-    """Import scanned REWORKED files after the user confirms Start Sync."""
-    summary = {"folders_created": 0, "files_imported": 0, "files_skipped": 0, "errors": []}
-
-    with get_connection() as connection:
-        for item in report.get("files", []):
-            source_path = Path(item["source_path"])
-            if not source_path.exists():
-                summary["errors"].append(f"{source_path} - source file no longer exists.")
-                continue
-
-            try:
-                duplicate = connection.execute(
-                    """
-                    SELECT id FROM document_imports
-                    WHERE source_path = ? AND file_name = ? AND file_size = ?
-                    """,
-                    (item["source_path"], item["file_name"], item["file_size"]),
-                ).fetchone()
-                if duplicate:
-                    summary["files_skipped"] += 1
-                    continue
-
-                folder_id, created_count = get_or_create_nested_folder(
-                    connection, item["category"], item["folder_parts"]
-                )
-                summary["folders_created"] += created_count
-
-                target_folder = folder_storage_path_from_parts(item["category"], item["folder_parts"])
-                target_folder.mkdir(parents=True, exist_ok=True)
-                target_file = target_folder / safe_path_part(item["file_name"])
-
-                if target_file.exists():
-                    summary["files_skipped"] += 1
-                    continue
-
-                shutil.copy2(source_path, target_file)
-                document_name = Path(item["file_name"]).stem
-                category_id = get_category_id(connection, item["category"])
-                cursor = connection.execute(
-                    """
-                    INSERT OR IGNORE INTO documents (
-                        name, code, department, keywords, file_name, file_path,
-                        category_id, folder_id
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        document_name,
-                        "",
-                        item["category"],
-                        "REWORKED sync",
-                        target_file.name,
-                        str(target_file),
-                        category_id,
-                        folder_id,
-                    ),
-                )
-
-                if cursor.rowcount == 0:
-                    summary["files_skipped"] += 1
-                    continue
-
-                document_id = cursor.lastrowid
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO document_imports (
-                        document_id, source_path, file_name, file_size
-                    )
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (document_id, item["source_path"], item["file_name"], item["file_size"]),
-                )
-                summary["files_imported"] += 1
-            except (OSError, sqlite3.Error) as error:
-                summary["errors"].append(f"{source_path}: {error}")
-
-        connection.execute(
-            """
-            INSERT INTO sync_logs (
-                source_folder_path, mode, folders_created, files_imported, files_skipped, errors
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(source_folder),
-                "sync",
-                summary["folders_created"],
-                summary["files_imported"],
-                summary["files_skipped"] + len(report.get("duplicates", [])),
-                "\n".join(summary["errors"] + report.get("errors", [])),
-            ),
-        )
-
-    return summary
-
-
 def apply_styles():
-    """Add Hector 2.8 stable light theme styling."""
+    """Add Hector 2.7 stable light theme styling."""
     st.markdown(
         """
         <style>
@@ -1414,7 +1142,7 @@ def show_search_result(item, documents):
 
 def show_home_page():
     """Show the Hector home page with global search, categories, and admin access."""
-    show_header("Hector 2.8", "Search all documents, folders, and categories.")
+    show_header("Hector 2.7", "Search all documents, folders, and categories.")
     show_breadcrumbs([{"label": "Home", "action": go_home}])
 
     st.markdown("## Global Document Search")
@@ -1833,97 +1561,6 @@ def show_document_details(documents, document):
     show_related_documents(documents, document)
 
 
-def show_sync_report(report):
-    """Show a readable preview/sync report for REWORKED imports."""
-    st.markdown("#### Sync Preview Report")
-    st.write(f"Folders to create: {len(report.get('folders', []))}")
-    st.write(f"Files to import: {len(report.get('files', []))}")
-    st.write(f"Duplicates/skipped: {len(report.get('duplicates', []))}")
-    st.write(f"Invalid files: {len(report.get('invalid', []))}")
-    st.write(f"Errors: {len(report.get('errors', []))}")
-
-    if report.get("folders"):
-        with st.expander("Folders that will be created"):
-            for folder in report["folders"]:
-                st.write(folder)
-
-    if report.get("files"):
-        with st.expander("Files that will be imported"):
-            for file_item in report["files"]:
-                st.write(file_item["relative_path"])
-
-    if report.get("duplicates"):
-        with st.expander("Duplicates / already imported"):
-            for file_item in report["duplicates"]:
-                st.write(file_item["relative_path"])
-
-    if report.get("invalid"):
-        with st.expander("Invalid files"):
-            for message in report["invalid"]:
-                st.write(message)
-
-    if report.get("errors"):
-        with st.expander("Errors"):
-            for message in report["errors"]:
-                st.write(message)
-
-
-def show_reworked_sync_section():
-    """Manual preview and sync from a local REWORKED folder."""
-    st.markdown("## Sync REWORKED Folder")
-    st.markdown(
-        """
-        <div class="admin-card">
-            <p class="secondary-text">
-                Expected structure: REWORKED / IMS / QMS, EMS, or OHSMS / nested folders / files.
-                Scan first to preview changes, then use Start Sync to import.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if "reworked_sync_path" not in st.session_state:
-        st.session_state.reworked_sync_path = ""
-    if "reworked_sync_report" not in st.session_state:
-        st.session_state.reworked_sync_report = None
-
-    source_path = st.text_input(
-        "REWORKED folder path",
-        key="reworked_sync_path",
-        placeholder=r"C:\path\to\REWORKED",
-    )
-
-    scan_clicked = st.button("Scan REWORKED Folder")
-    if scan_clicked:
-        report = scan_reworked_folder(source_path)
-        st.session_state.reworked_sync_report = report
-        if report["errors"] and not report["files"] and not report["folders"]:
-            st.error(report["errors"][0])
-        else:
-            st.success("Scan complete. Review the preview before starting sync.")
-
-    report = st.session_state.reworked_sync_report
-    if report:
-        show_sync_report(report)
-
-        if report.get("files"):
-            if st.button("Start Sync"):
-                summary = import_reworked_scan(report, source_path)
-                st.success(
-                    "Sync complete: "
-                    f"{summary['folders_created']} folders created, "
-                    f"{summary['files_imported']} files imported, "
-                    f"{summary['files_skipped']} files skipped."
-                )
-                if summary["errors"]:
-                    st.warning("Some errors occurred. See sync log details in the database.")
-                st.session_state.reworked_sync_report = scan_reworked_folder(source_path)
-                st.rerun()
-        else:
-            st.info("No new files are ready to import from this scan.")
-
-
 def show_admin_page():
     """Show admin tools for creating and deleting folders."""
     if st.button("Back to Home"):
@@ -1941,8 +1578,6 @@ def show_admin_page():
     category_names = categories["name"].astype(str).tolist()
     folders = load_folders()
     documents = load_documents()
-
-    show_reworked_sync_section()
 
     st.markdown("## Manage Main Categories")
     st.markdown('<div class="admin-card">', unsafe_allow_html=True)
@@ -2096,7 +1731,7 @@ def show_admin_page():
 
 
 def main():
-    st.set_page_config(page_title="Hector 2.8", layout="wide")
+    st.set_page_config(page_title="Hector 2.7", layout="wide")
     ensure_storage()
     apply_styles()
 
